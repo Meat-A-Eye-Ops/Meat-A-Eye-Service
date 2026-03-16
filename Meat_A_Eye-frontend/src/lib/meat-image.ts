@@ -1,42 +1,43 @@
 /**
  * 부위명(part_name) → 냉장고 카드 배경 이미지 URL 매핑
  *
- * 이미지 파일은 /public/back_images/{part_name}_image.png 형식으로 저장되어 있습니다.
- * part_name 은 DB meat_info.part_name(영문)과 1:1 대응합니다.
+ * 카테고리(Beef/Pork)에 따라 랜덤 음식 사진을 반환합니다.
  */
 
-/** 이미지가 존재하는 부위 목록 (실제 /public/back_images 에 있는 파일 기준) */
-const AVAILABLE_IMAGES: ReadonlySet<string> = new Set([
-  // 소 9부위
-  "Beef_Tenderloin",
-  "Beef_Ribeye",
-  "Beef_Sirloin",
-  "Beef_Chuck",
-  "Beef_Round",
-  "Beef_Brisket",
-  "Beef_Shank",
-  "Beef_Rib",
-  "Beef_Shoulder",
-  // 돼지 7부위
-  "Pork_Tenderloin",
-  "Pork_Loin",
-  "Pork_Belly",
-  "Pork_Ham",
-  "Pork_Neck",
-  "Pork_PicnicShoulder",
-  "Pork_Ribs",
-]);
+const BEEF_IMAGES: readonly string[] = [
+  "/icons/beef/amelie123-raw-meat-597952_1920.webp",
+  "/icons/beef/Beef_image1.webp",
+  "/icons/beef/dbreen-steak-1083567_1920.webp",
+  "/icons/beef/lisabaker-dish-6764308_1920.webp",
+  "/icons/beef/muju_pixel-grilled-8042308_1920.webp",
+  "/icons/beef/nickygirly-meal-5512580_1920.webp",
+  "/icons/beef/publicdomainpictures-lemon-69756_1920.webp",
+  "/icons/beef/videofan-having-lunch-985319_1920.webp",
+  "/icons/beef/zrenate-kitchen-2071244_1920.webp",
+];
+
+const PORK_IMAGES: readonly string[] = [
+  "/icons/pork/cegoh-braise-pork-1057835_1920.webp",
+  "/icons/pork/frankzhang0711-twice-cooked-pork-2556634_1920.webp",
+  "/icons/pork/hnbs-roast-crust-2278382_1920.webp",
+  "/icons/pork/jonathanvalencia5-pork-intestine-2187512_1920.webp",
+  "/icons/pork/luow-pork-4265997_1920.webp",
+  "/icons/pork/ritae-schnitzel-3279045_1920.webp",
+  "/icons/pork/shy_photographer-pork-tenderloin-3790406_1920.webp",
+  "/icons/pork/wanwalittle-food-3861918_1920.webp",
+  "/icons/pork/webandi-fillet-4846847_1920.webp",
+  "/icons/pork/zizitop101-pork-skewers-7657178_1920.webp",
+];
 
 /**
- * 부위 영문명으로 카드 배경 이미지 URL을 반환합니다.
- * 해당 이미지가 없으면 `null`을 반환합니다.
+ * 부위 영문명으로 랜덤 음식 이미지 URL을 반환합니다.
+ * 해당 카테고리가 없으면 `null`을 반환합니다.
  */
-export function getMeatCardImage(partName: string | null | undefined): string | null {
+export function getMeatCardImage(
+  partName: string | null | undefined,
+): string | null {
   if (!partName) return null;
 
-  if (AVAILABLE_IMAGES.has(partName)) {
-    return `/back_images/${partName}_image.png`;
-  }
-
-  return null;
+  const pool = partName.startsWith("Pork") ? PORK_IMAGES : BEEF_IMAGES;
+  return pool[Math.floor(Math.random() * pool.length)];
 }

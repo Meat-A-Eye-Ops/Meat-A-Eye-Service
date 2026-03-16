@@ -5,7 +5,6 @@
 
 interface IconEntry {
   name: string;
-  keywords: string[];
   url: string;
 }
 
