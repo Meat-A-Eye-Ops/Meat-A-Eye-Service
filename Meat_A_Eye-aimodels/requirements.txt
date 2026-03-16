@@ -1,0 +1,61 @@
+# ==============================
+# MeatHub AI Server - Requirements
+# ==============================
+# 설치: pip install -r requirements.txt
+#
+# ⚠️ GPU별 CUDA 버전이 다르므로, 본인 환경에 맞게 아래 설정 확인
+#   - RTX 5060/5070/5080/5090 (Blackwell) → CUDA 12.8 (cu128)
+#   - RTX 4060/4070/4080/4090 (Ada)       → CUDA 12.6 (cu126)
+
+# ── Deep Learning (CUDA 12.8 / RTX 5060) ────────────────
+# 🔄 cu126 환경이면 아래 3줄을 주석처리하고 그 아래 cu126 블록 해제
+--index-url https://download.pytorch.org/whl/cu128
+torch==2.10.0+cu128
+torchvision==0.25.0+cu128
+
+# ── Deep Learning (CUDA 12.6 / RTX 40xx) ────────────────
+# --index-url https://download.pytorch.org/whl/cu126
+# torch==2.6.0+cu126
+# torchvision==0.21.0+cu126
+
+efficientnet_pytorch==0.7.1
+
+# ── OCR ──────────────────────────────────────────────────
+easyocr==1.7.2
+
+# ── PaddlePaddle GPU (OCR 인식 모델) ─────────────────────
+# ⚠️ PyTorch와 DLL 충돌 가능 → requirements.txt에 넣지 않고 별도 설치
+# ✅ 설치 순서 (반드시 이 순서대로):
+#   1) pip install -r requirements.txt          ← 먼저 PyTorch 설치
+#   2) 아래 중 본인 CUDA 버전에 맞는 명령어 실행:
+#
+#   [cu128 - RTX 5060 등]
+#     pip install paddlepaddle-gpu==3.0.0.dev20260214 -i https://www.paddlepaddle.org.cn/packages/nightly/cu126/
+#     ※ cu128 전용 인덱스가 없으므로 cu126 빌드 사용 (CUDA 하위호환 가능)
+#     ※ 만약 cu126 빌드가 안 되면 최신 dev 버전 시도:
+#        pip install paddlepaddle-gpu -i https://www.paddlepaddle.org.cn/packages/nightly/cu126/ --pre
+#
+#   [cu126 - RTX 4060 등]
+#     pip install paddlepaddle-gpu -i https://www.paddlepaddle.org.cn/packages/nightly/cu126/ --pre
+#
+# ⚠️ 전제 조건:
+#   - CUDA 12.x + cuDNN 9.x 설치 필요 (NVIDIA GPU 필수)
+#   - CPU 전용: pip install paddlepaddle --pre
+# PaddleOCR 소스: git clone https://github.com/PaddlePaddle/PaddleOCR.git ai-server/OCR/PaddleOCR
+
+# ── 이미지 처리 ──────────────────────────────────────────
+opencv-python>=4.8.0
+Pillow>=10.0.0
+numpy>=1.24.0
+albumentations>=1.3.0
+
+# ── 웹 서버 (FastAPI) ────────────────────────────────────
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+
+# ── 유틸리티 ─────────────────────────────────────────────
+matplotlib
+scikit-learn
+python-dotenv>=1.0.0
+PyYAML>=6.0

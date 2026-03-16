@@ -1,0 +1,446 @@
+# 🥩 Meat-A-Eye AI Models
+
+> EfficientNet-B2 기반 고기 부위 자동 분류 AI 엔진 — 소고기 9부위 / 돼지고기 7부위 실시간 판별 및 Grad-CAM 시각화
+
+## 📋 목차
+
+- [프로젝트 개요](#프로젝트-개요)
+- [모델 아키텍처](#모델-아키텍처)
+- [분류 클래스](#분류-클래스)
+- [학습 전략](#학습-전략)
+- [데이터 파이프라인](#데이터-파이프라인)
+- [API 서버](#api-서버)
+- [OCR 엔진](#ocr-엔진)
+- [프로젝트 구조](#프로젝트-구조)
+- [실행 방법](#실행-방법)
+- [성능 지표](#성능-지표)
+
+---
+
+## 프로젝트 개요
+
+Meat-A-Eye AI 서버는 촬영된 고기 이미지를 입력받아 **소고기 9개 부위** 또는 **돼지고기 7개 부위**를 실시간으로 분류하고, **Grad-CAM 히트맵**을 통해 모델이 어떤 시각적 특징(질감, 결, 마블링 등)에 주목했는지 시각화합니다.
+
+현실 환경(그림자, 조명 변화, 배경)에서의 강건한 인식을 목표로, 유튜브·현장 이미지를 활용한 데이터 수집과 4차에 걸친 점진적 파인튜닝으로 최종 **소고기 90.0%, 돼지고기 94.2%** 정확도를 달성했습니다.
+
+---
+
+## 모델 아키텍처
+
+### EfficientNet-B2 선택 근거
+
+EfficientNet은 **Compound Scaling**을 통해 네트워크의 깊이(Depth), 너비(Width), 해상도(Resolution)를 동시에 최적 비율로 확장하는 아키텍처입니다. B2는 성능과 추론 속도의 균형점으로, 실시간 서비스에 적합합니다.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  EfficientNet-B2 Architecture                                   │
+│                                                                 │
+│  Input (260×260×3)                                              │
+│    ↓                                                            │
+│  Stem Conv (3×3, stride 2)                                      │
+│    ↓                                                            │
+│  MBConv Block ×16 (7 stages)                                    │
+│  ┌───────────────────────────────────────────────┐              │
+│  │  Depthwise Separable Convolution              │              │
+│  │    → 연산량 절감 (일반 Conv 대비 1/k² 수준)       │             │
+│  │  Squeeze-and-Excitation (SE) Block            │              │
+│  │    → 채널별 중요도 재가중 (질감·마블링 강조)       │              │
+│  │  Skip Connection (Residual)                   │              │
+│  │    → 깊은 네트워크에서도 그래디언트 안정 전파       │              │
+│  └───────────────────────────────────────────────┘              │
+│    ↓                                                            │
+│  Head Conv (1×1) → Global Average Pooling                       │
+│    ↓                                                            │
+│  Custom Classifier                                              │
+│  ┌───────────────────────────────────┐                          │
+│  │  Dropout(p=0.4)                   │                          │
+│  │  Linear(1408 → num_classes)       │                          │
+│  └───────────────────────────────────┘                          │
+│    ↓                                                            │
+│  Output: Softmax Probabilities                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 핵심 구성 요소
+
+| 구성 요소 | 역할 | 고기 분류에서의 의미 |
+|-----------|------|---------------------|
+| **MBConv (Mobile Inverted Bottleneck)** | Depthwise Separable Conv로 공간 특징 추출 | 고기의 결 방향, 지방 분포 패턴 학습 |
+| **SE Block (Squeeze-and-Excitation)** | 채널별 attention으로 중요 특징 강조 | 마블링·색상 채널에 높은 가중치 → 부위별 질감 차이 포착 |
+| **Compound Scaling** | depth·width·resolution 동시 최적화 | 260×260 해상도에서 세밀한 질감 구분 가능 |
+| **Skip Connection** | 잔차 연결로 학습 안정성 확보 | 파인튜닝 시 기존 특징 보존에 기여 |
+
+### Grad-CAM 시각화
+
+모델의 마지막 합성곱 레이어(`model.features[-1]`)에 그래디언트 기반 Class Activation Map을 생성하여, 각 예측에서 모델이 **어디를 보고 판단했는지** 히트맵으로 시각화합니다.
+
+```python
+# Grad-CAM 핵심 로직
+gradients = hook_backward(target_class)         # 클래스별 그래디언트
+weights = global_average_pool(gradients)         # 채널별 중요도
+cam = ReLU(Σ weights × feature_maps)            # 가중합 → 활성화
+heatmap = normalize(cam) → JET colormap         # 0~255 컬러맵
+overlay = 0.55 × original + 0.45 × heatmap      # 원본과 합성
+```
+
+---
+
+## 분류 클래스
+
+### 소고기 9부위
+
+| Index | 영문 클래스명 | 한국어 부위명 |
+|-------|-------------|-------------|
+| 0 | `Beef_Brisket` | 양지 |
+| 1 | `Beef_Chuck` | 목심 |
+| 2 | `Beef_Rib` | 갈비 |
+| 3 | `Beef_Ribeye` | 등심 |
+| 4 | `Beef_Round` | 우둔 |
+| 5 | `Beef_Shank` | 사태 |
+| 6 | `Beef_Shoulder` | 앞다리 |
+| 7 | `Beef_Sirloin` | 채끝 |
+| 8 | `Beef_Tenderloin` | 안심 |
+
+> **참고:** `Beef_BottomRound`는 4차 학습에서 `Beef_Round`로 병합 (시각적 유사성에 의한 클래스 최적화)
+
+### 돼지고기 7부위
+
+| Index | 영문 클래스명 | 한국어 부위명 |
+|-------|-------------|-------------|
+| 0 | `Pork_Belly` | 삼겹살 |
+| 1 | `Pork_Ham` | 뒷다리 |
+| 2 | `Pork_Loin` | 등심 |
+| 3 | `Pork_Neck` | 목살 |
+| 4 | `Pork_PicnicShoulder` | 앞다리 |
+| 5 | `Pork_Ribs` | 갈비 |
+| 6 | `Pork_Tenderloin` | 안심 |
+
+---
+
+## 학습 전략
+
+### 점진적 파인튜닝 (Progressive Fine-tuning)
+
+기존 학습된 가중치를 보존하면서 새 데이터를 학습하는 전략입니다. **Catastrophic Forgetting**을 방지하기 위해 다음 기법들을 조합합니다.
+
+#### 1. 차별적 학습률 (Differential Learning Rate)
+
+```python
+optimizer = AdamW([
+    {"params": backbone_params, "lr": 1e-4},   # 기존 특징 추출기: 미세 조정
+    {"params": head_params,     "lr": 1e-3},   # 새 분류기: 빠른 학습
+], weight_decay=1e-2)
+```
+
+- **Backbone (1e-4):** ImageNet에서 학습된 범용 시각 특징을 거의 유지하면서 고기 도메인에 미세 적응
+- **Classification Head (1e-3):** 새로 초기화된 분류기는 10배 빠른 속도로 부위별 특징 학습
+
+#### 2. Warmup + Cosine Annealing 스케줄러
+
+```
+LR
+│  ╱‾‾‾‾‾‾╲
+│ ╱        ╲          ╱‾‾╲
+│╱          ╲        ╱    ╲        ╱‾╲
+│            ╲      ╱      ╲      ╱   ╲
+│             ╲    ╱        ╲    ╱     ╲
+│              ╲  ╱          ╲  ╱       ╲
+│               ╲╱            ╲╱         ╲→
+├──────────────────────────────────────────→ Epoch
+│← Warmup →│← Cosine Annealing with Warm Restarts →│
+   (3 epochs)
+   1e-6 → 1e-4
+```
+
+- **Warmup (3 epochs):** LR을 1e-6에서 시작하여 점진적으로 증가 → 학습 초기 불안정성 방지
+- **Cosine Annealing:** 주기적으로 LR을 올렸다 내리면서 local minima 탈출
+
+#### 3. 데이터 증강 (Albumentations)
+
+| 증강 기법 | 파라미터 | 목적 |
+|-----------|---------|------|
+| `Affine` | translate 10%, scale 0.8~1.2, rotate ±30° | 다양한 촬영 각도 대응 |
+| `HorizontalFlip` | p=0.5 | 좌우 대칭 불변성 |
+| `VerticalFlip` | p=0.3 | 상하 배치 변화 대응 |
+| `RandomBrightnessContrast` | - | 조명 변화 대응 |
+| `HueSaturationValue` | - | 색온도·포화도 변화 대응 |
+| `CLAHE` | - | 저조도 환경 대비 강화 |
+| `GaussNoise` | - | 카메라 노이즈 강건성 |
+| `GaussianBlur` | - | 초점 흐림 대응 |
+| `CoarseDropout` | - | Cutout 효과로 과적합 방지 |
+
+#### 4. 클래스 불균형 처리
+
+```python
+# WeightedRandomSampler: 소수 클래스 과표집
+class_counts = [len(os.listdir(class_dir)) for class_dir in classes]
+weights = 1.0 / torch.tensor(class_counts, dtype=torch.float)
+sample_weights = weights[labels]
+sampler = WeightedRandomSampler(sample_weights, len(sample_weights))
+```
+
+#### 5. 추가 정규화
+
+| 기법 | 설정 | 효과 |
+|------|------|------|
+| **Label Smoothing** | ε = 0.1 | 과도한 확신 방지, 일반화 향상 |
+| **Mixup** | α = 0.2 | 두 이미지/라벨 혼합으로 결정 경계 부드럽게 |
+| **Gradient Clipping** | max_norm = 1.0 | 그래디언트 폭발 방지 |
+| **Dropout** | p = 0.4 | 분류기 과적합 억제 |
+| **Early Stopping** | patience = 10 | 검증 손실 정체 시 학습 중단 |
+
+#### 6. TTA (Test Time Augmentation)
+
+추론 시 5가지 변환을 적용한 예측을 Softmax 앙상블하여 안정적 결과 도출
+
+---
+
+## 데이터 파이프라인
+
+### 수집 → 정제 → 분할 흐름
+
+```
+┌─────────────┐    ┌──────────────┐    ┌──────────────┐    ┌────────────┐
+│ 데이터 수집   │ → │ 1차 자동 정제  │ → │ 2차 수동 정제  │ → │ 균등 분할    │
+│             │    │              │    │              │    │            │
+│ • 연구용 DB  │    │ • 형식 필터   │    │ • 오분류 제거  │    │ • 100장/부위│
+│ • 유튜브 캡처 │    │ • 크기 필터   │    │ • 품질 검수   │    │ • 70/15/15 │
+│ • 현장 촬영   │    │ • 중복 제거   │    │ • 경계 케이스  │    │ • seed=42  │
+└─────────────┘    └──────────────┘    └──────────────┘    └────────────┘
+```
+
+### Dataset Balancer
+
+부위별 학습 데이터 불균형을 해결하기 위한 CLI 도구:
+
+```bash
+# 소고기: 부위별 100장씩 균등 분할
+python dataset_balancer.py split --samples 100
+
+# 돼지고기: 부위별 50장씩 균등 분할
+python pork_dataset_balancer.py split --samples 50
+
+# 분할 결과:  train 70장 / val 15장 / test 15장 (per class)
+```
+
+### 데이터셋 디렉토리 구조
+
+```
+data/
+├── raw_dataset/          # 정제 전 원본
+│   ├── train/
+│   │   ├── Beef_Brisket/
+│   │   ├── Beef_Chuck/
+│   │   └── ...
+│   └── test/
+├── train_dataset_v3/     # 3차 학습 데이터
+│   ├── train/
+│   ├── val/
+│   └── test/
+└── train_dataset_v4/     # 4차 학습 데이터 (최종)
+    ├── train/
+    ├── val/
+    └── test/
+```
+
+---
+
+## API 서버
+
+### FastAPI 엔드포인트 (Port: 8001)
+
+| Method | Endpoint | 기능 | 입력 | 출력 |
+|--------|----------|------|------|------|
+| `GET` | `/` | Health Check | - | `{"status": "running"}` |
+| `POST` | `/predict` | 소고기 분류 (Legacy) | `image: UploadFile` | `class_name`, `confidence`, `heatmap_image` |
+| `POST` | `/ai/analyze` | 통합 분석 | `image: UploadFile`, `mode: str` | 분류 결과 + Grad-CAM 히트맵 |
+
+### 분석 모드 (`/ai/analyze`)
+
+| 모드 | 설명 | 모델 |
+|------|------|------|
+| `beef` | 소고기 9부위 분류 + Grad-CAM | `b2_imagenet_beef_100-v4.pth` |
+| `pork` | 돼지고기 7부위 분류 + Grad-CAM | `b2_imagenet_pork_50-v4.pth` |
+| `ocr` | 축산물 이력번호 OCR 추출 | EasyOCR (한/영) |
+
+### 응답 형식
+
+```json
+{
+  "status": "success",
+  "message": "Success",
+  "data": {
+    "class_name": "Beef_Ribeye",
+    "confidence": 0.9523,
+    "heatmap_image": "base64_encoded_jpeg..."
+  }
+}
+```
+
+### 에러 코드
+
+| 코드 | 의미 |
+|------|------|
+| `LOW_CONFIDENCE` | 신뢰도 75% 미만 |
+| `INVALID_IMAGE` | 이미지 형식 오류 |
+| `NOT_MEAT` | 고기로 인식 불가 |
+| `OCR_FAILED` | 이력번호 추출 실패 |
+| `SERVER_ERROR` | 내부 서버 오류 |
+
+---
+
+## OCR 엔진
+
+축산물 이력번호 라벨에서 이력번호를 자동 추출하는 엔진입니다.
+
+### 전처리 파이프라인
+
+```
+입력 이미지
+    ↓
+┌─────────────────────────────────┐
+│ 앙상블 전처리 (2개 파이프라인)     │
+│                                 │
+│ Pipeline A: Bilateral Filter    │
+│   2× 업스케일 → 그레이스케일 →    │
+│   양방향 필터 (노이즈 제거)        │
+│                                 │
+│ Pipeline B: Adaptive Threshold  │
+│   2× 업스케일 → 그레이스케일 →    │
+│   가우시안 적응 이진화             │
+└─────────────────────────────────┘
+    ↓
+EasyOCR (한국어 + 영어)
+    ↓
+텍스트 후처리 (박스 병합 → 정제 → 앵커 기반 스코어링)
+    ↓
+이력번호 패턴 매칭
+```
+
+### 인식 패턴
+
+| 패턴 | 형식 | 설명 |
+|------|------|------|
+| `^\d{12}$` | 12자리 숫자 | 국내산/수입 기본 이력번호 |
+| `^L\d{14}$` | L + 14자리 | 국내산 묶음번호 |
+| `^A\d{19,29}$` | A + 19~29자리 | 수입/배치 번호 |
+
+---
+
+## 프로젝트 구조
+
+```
+Meat_A_Eye-aimodels/
+├── README.md                          # 본 문서
+├── requirements.txt                   # 의존성 패키지
+│
+├── ai-server/
+│   ├── main.py                        # FastAPI 서버 엔트리포인트
+│   ├── predict_b2.py                  # 소고기 추론 엔진 (Singleton + Grad-CAM)
+│   ├── predict_pork.py                # 돼지고기 추론 엔진 (Singleton + Grad-CAM)
+│   ├── vision_engine.py               # Legacy 호환 래퍼
+│   ├── ocr_engine.py                  # 축산물 이력번호 OCR (EasyOCR)
+│   ├── web_processor.py               # 이미지 바이트 → RGB 배열 변환
+│   │
+│   ├── finetune.py                    # 소고기 모델 파인튜닝 스크립트
+│   ├── train.py                       # 돼지고기 모델 학습 스크립트
+│   ├── dataset_balancer.py            # 소고기 데이터셋 균등 분할 도구
+│   ├── pork_dataset_balancer.py       # 돼지고기 데이터셋 균등 분할 도구
+│   │
+│   ├── test_all.py                    # 소고기 전체 데이터셋 교차 평가
+│   ├── test_visualize.py              # 소고기 단일 데이터셋 시각화 테스트
+│   ├── pork_test_all.py               # 돼지고기 전체 데이터셋 교차 평가
+│   ├── pork_test_visualize.py         # 돼지고기 단일 데이터셋 시각화 테스트
+│   │
+│   ├── models/
+│   │   ├── b2_imagenet_beef_100-v4.pth    # 소고기 최종 모델 (9부위)
+│   │   └── b2_imagenet_pork_50-v4.pth     # 돼지고기 최종 모델 (7부위)
+│   │
+│   ├── utils/
+│   │   ├── logger.py                  # 로깅 유틸리티
+│   │   └── response.py               # 표준 API 응답 포맷
+│   │
+│   ├── convnext_l/                    # ConvNeXt-L 실험 (비교군)
+│   ├── efficientnetv2_l/              # EfficientNetV2-L 실험 (비교군)
+│   └── swin_transformer/             # Swin Transformer 실험 (비교군)
+│
+└── data/
+    ├── train_dataset_v3/              # 3차 데이터셋
+    └── train_dataset_v4/              # 4차 데이터셋 (최종)
+```
+
+---
+
+## 실행 방법
+
+### 환경 설정
+
+```bash
+# CUDA 12.6 환경 필수
+pip install -r requirements.txt
+
+# PyTorch CUDA 확인
+python -c "import torch; print(torch.cuda.is_available())"
+```
+
+### AI 서버 실행
+
+```bash
+cd ai-server
+python main.py
+# → http://0.0.0.0:8001 에서 서버 시작
+```
+
+### 모델 학습
+
+```bash
+# 고기 파인튜닝
+python finetune.py
+
+# 고기 학습
+python train.py
+
+# 테스트 평가
+python test_all.py          # 소고기 전체 평가
+python pork_test_all.py     # 돼지고기 전체 평가
+```
+
+---
+
+## 성능 지표
+
+### 최종 (4차 파인튜닝) 결과
+
+| 모델 | 분류 대상 | 정확도 | 클래스 수 | 부위당 학습 데이터 |
+|------|-----------|--------|-----------|------------------|
+| **Beef v4** | 소고기 | **90.0%** | 9부위 | 100장 (70/15/15) |
+| **Pork v4** | 돼지고기 | **94.2%** | 7부위 | 50장 (35/8/7) |
+
+### 성능 변화 추이
+
+```
+Accuracy
+100% │
+ 95% │                                    ● 94.2% (돼지)
+ 90% │                         ● 90.0% (소)
+ 85% │              ●
+ 80% │        ●
+ 75% │
+ 70% │  ●
+     └──────────────────────────────→
+       1차    2차    3차    4차
+```
+
+---
+
+## 기술 스택
+
+| 영역 | 기술 |
+|------|------|
+| **Deep Learning** | PyTorch 2.6.0 (CUDA 12.6), torchvision |
+| **Model** | EfficientNet-B2 (ImageNet pretrained) |
+| **Augmentation** | Albumentations 2.0.8 |
+| **OCR** | EasyOCR 1.7.2 (한국어 + 영어) |
+| **Web Server** | FastAPI 0.128.2, Uvicorn |
+| **Visualization** | Matplotlib, Seaborn, OpenCV |
+| **Evaluation** | scikit-learn (Confusion Matrix, per-class metrics) |

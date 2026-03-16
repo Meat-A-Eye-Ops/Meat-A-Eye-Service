@@ -1,0 +1,89 @@
+# ==============================
+# MeatHub AI Models — .gitignore
+# ==============================
+
+# ── Python 가상환경 ──────────────────────────────────────
+venv/
+.venv/
+**/venv/
+**/.venv/
+
+# ── Python 캐시 ──────────────────────────────────────────
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ── 모델 가중치 (대용량 — Git LFS 또는 별도 공유) ────────
+*.pth
+*.pt
+*.onnx
+*.h5
+*.ckpt
+*.weights
+*.pdparams
+*.pdopt
+*.pdmodel
+*.pdiparams
+*.nb
+*.tar
+
+# ── 데이터셋 (대용량) ───────────────────────────────────
+data/
+dataset/
+dataset_final/
+
+# ── 학습 결과물 / 로그 ──────────────────────────────────
+test_results/
+**/test_results*/
+**/pork_test_results*/
+outputs/
+*.log
+logs/
+
+# ── OCR 학습 대용량 산출물 (스크립트는 추적) ────────────
+ai-server/OCR/pretrained/
+ai-server/OCR/rec_output/
+ai-server/OCR/rec_dataset/crop_images/
+ai-server/OCR/PaddleOCR/
+# 참고: OCR/*.py, rec_dataset/*.txt 등 스크립트/라벨은 추적됨
+
+# ── 사용하지 않는 실험 모델 폴더 ────────────────────────
+ai-server/convnext_l/
+ai-server/efficientnetv2_l/
+ai-server/swin_transformer/
+
+# ── Hugging Face 캐시 ───────────────────────────────────
+.cache/
+**/.cache/
+
+# ── IDE / 에디터 ─────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS 파일 ──────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── 환경변수 / 시크릿 ───────────────────────────────────
+.env
+.env.*
+*.env
+
+# ── 임시 / 백업 ─────────────────────────────────────────
+*.tmp
+*.temp
+*.bak
+*.backup
+*_backup.*
+*_backup_*
+
+requirements_backup.txt
+
+models/
+data_cleaning/

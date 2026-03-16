@@ -1,0 +1,57 @@
+# ==============================
+# MeatHub Backend (FastAPI) — .gitignore
+# ==============================
+
+# ── Python 가상환경 ──────────────────────────────────────
+venv/
+.venv/
+**/venv/
+**/.venv/
+
+# ── Python 캐시 ──────────────────────────────────────────
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# ── 환경변수 / 시크릿 ───────────────────────────────────
+.env
+.env.*
+*.env
+!.env.example
+secrets.json
+credentials.json
+config/secrets.*
+
+# ── DB 임시 스크립트 ─────────────────────────────────────
+migrate_*.py
+check_db*.py
+test_db*.py
+*.sql.backup
+*.sql.bak
+database_backup/
+db_dump/
+scripts/*.json
+
+# ── IDE / 에디터 ─────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS 파일 ──────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── 임시 / 백업 / 로그 ──────────────────────────────────
+*.tmp
+*.temp
+*.bak
+*.backup
+*.log
+logs/
+tempCodeRunnerFile.py

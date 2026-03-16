@@ -1,0 +1,603 @@
+"""대시보드 API - 실시간 인기 부위, 통계 등."""
+import asyncio
+import logging
+from collections import defaultdict
+from datetime import date, datetime, timedelta
+from typing import List
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select, func, desc
+from sqlalchemy.ext.asyncio import AsyncSession
+from pydantic import BaseModel
+
+from ..apis import fetch_kamis_price_period
+from ..config.database import get_db
+from ..config.timezone import now_kst
+from ..models.recognition_log import RecognitionLog
+from ..services.price_service import PriceService
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+price_service = PriceService()
+
+
+class PopularCutItem(BaseModel):
+    name: str
+    count: int
+    trend: str  # 예: "+12%"
+    currentPrice: int | None = None
+
+
+class PopularCutsResponse(BaseModel):
+    items: List[PopularCutItem]
+
+
+class GradePriceItem(BaseModel):
+    grade: str
+    price: int
+    unit: str = "100g"
+    priceDate: str | None = None
+    trend: str = "flat"
+
+
+class PriceItem(BaseModel):
+    partName: str
+    category: str  # "beef" | "pork"
+    currentPrice: int
+    unit: str = "100g"
+    priceDate: str | None = None
+    gradePrices: List[GradePriceItem] = []
+
+
+class DashboardPricesResponse(BaseModel):
+    beef: List[PriceItem]
+    pork: List[PriceItem]
+
+
+@router.get(
+    "/prices",
+    response_model=DashboardPricesResponse,
+    summary="실시간 돼지/소 가격 (100g당)",
+)
+async def get_dashboard_prices(
+    region: str = "전국",
+    beef_part: str | None = None,
+    pork_part: str | None = None,
+    grade_code: str = "00",
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    소(등심, 갈비), 돼지(삼겹, 목살) 대표 부위 100g당 가격 조회.
+    market_prices 캐시 또는 KAMIS API 사용.
+    
+    Args:
+        region: 지역코드 (기본값: "전국")
+        beef_part: 소고기 부위 코드 (기본값: None - 전체, 특정 부위 선택 시 해당 부위만 조회)
+        pork_part: 돼지고기 부위 코드 (기본값: None - 전체, 특정 부위 선택 시 해당 부위만 조회)
+        grade_code: 등급코드 (기본값: "00" - 전체 평균)
+    
+    동작 방식:
+        - beef_part와 pork_part가 모두 None이면: 기본 부위 목록 반환 (전체 선택)
+        - beef_part만 지정되면: 해당 소고기 부위만 조회, 돼지고기는 조회하지 않음
+        - pork_part만 지정되면: 해당 돼지고기 부위만 조회, 소고기는 조회하지 않음
+    """
+    # 기본 부위 목록 (테이블 구조에 맞춤: 품목명/품종명 형식)
+    # 주의: 프론트엔드에서 카테고리별로 올바른 부위를 전달하므로, 
+    # 여기서는 특정 부위가 지정되지 않았을 때만 사용됨 (실제로는 사용되지 않음)
+    default_beef_parts = [("Beef_Ribeye", "소/등심"), ("Beef_Rib", "소/갈비")]
+    default_pork_parts = [
+        ("Pork_Tenderloin", "돼지/안심"),
+        ("Pork_Loin", "돼지/등심"),
+        ("Pork_Neck", "돼지/목심"),
+        ("Pork_PicnicShoulder", "돼지/앞다리"),
+        ("Pork_Ham", "돼지/뒷다리"),
+        ("Pork_Belly", "돼지/삼겹살"),
+        ("Pork_Ribs", "돼지/갈비"),
+    ]
+    
+    # 수입 소고기 기본 부위 목록 (갈비, 갈비살 - 호주산만)
+    default_import_beef_parts = [
+        ("Import_Beef_Rib_AU", "수입 소고기/갈비 - 호주산"),
+        ("Import_Beef_Ribeye_AU", "수입 소고기/갈비살 - 호주산"),
+    ]
+    
+    # 수입 돼지고기 기본 부위 목록 (삼겹살만)
+    default_import_pork_parts = [("Import_Pork_Belly", "수입 돼지고기/삼겹살")]
+    
+    # 부위 필터 적용 - 부위 코드와 이름 매핑 (테이블 구조에 맞춤)
+    # 품목명/품종명 구조: 소/안심, 소/등심, 소/설도, 소/양지, 소/갈비
+    #                    돼지/앞다리, 돼지/삼겹살, 돼지/갈비, 돼지/목심
+    #                    수입 소고기/양지, 수입 소고기/갈비 등
+    beef_part_map = {
+        "Beef_Tenderloin": "소/안심",
+        "Beef_Ribeye": "소/등심",
+        "Beef_Sirloin": "소/채끝",
+        "Beef_Chuck": "소/목심",
+        "Beef_Shoulder": "소/앞다리",
+        "Beef_Round": "소/우둔",
+        "Beef_Brisket": "소/양지",
+        "Beef_Shank": "소/사태",
+        "Beef_Rib": "소/갈비",
+        "Import_Beef_Rib_AU": "수입 소고기/갈비 - 호주산",
+        "Import_Beef_Ribeye_AU": "수입 소고기/갈비살 - 호주산",
+    }
+    pork_part_map = {
+        "Pork_Tenderloin": "돼지/안심",
+        "Pork_Loin": "돼지/등심",
+        "Pork_Neck": "돼지/목심",
+        "Pork_PicnicShoulder": "돼지/앞다리",
+        "Pork_Ham": "돼지/뒷다리",
+        "Pork_Belly": "돼지/삼겹살",
+        "Pork_Ribs": "돼지/갈비",
+        "Import_Pork_Belly": "수입 돼지고기/삼겹살",
+    }
+    
+    # 부위 필터링 로직:
+    # 1. 특정 부위가 선택된 경우: 해당 부위만 조회
+    # 2. 부위가 None인 경우: 기본 부위 목록 사용 (전체 선택 시)
+    # 3. 잘못된 코드인 경우: 빈 리스트 (조회하지 않음)
+    
+    # 소고기 부위 결정 (국내 소고기 + 수입 소고기)
+    if beef_part and beef_part in beef_part_map:
+        # 특정 소고기 부위 선택 (국내 또는 수입)
+        beef_parts = [(beef_part, beef_part_map[beef_part])]
+    elif beef_part is None:
+        # beef_part가 None일 때: 수입 소고기인지 확인
+        # 수입 소고기는 part_name이 "Import_Beef_"로 시작하는 경우
+        # 하지만 현재 API는 part_name을 받지 않으므로, beef_part가 None이고
+        # pork_part도 None이면 기본 부위 목록 사용 (국내 소고기)
+        # pork_part가 지정되어 있으면 소고기는 조회하지 않음
+        if pork_part is None:
+            # beef_part와 pork_part가 모두 None이면 국내 소고기 기본 부위 사용
+            beef_parts = default_beef_parts
+        else:
+            beef_parts = []  # 돼지고기만 선택된 경우 소고기는 조회하지 않음
+    else:
+        # 잘못된 beef_part 코드인 경우 빈 리스트
+        beef_parts = []
+    
+    # 돼지고기 부위 결정 (국내 돼지고기 + 수입 돼지고기)
+    if pork_part and pork_part in pork_part_map:
+        # 특정 돼지고기 부위 선택 (국내 또는 수입)
+        pork_parts = [(pork_part, pork_part_map[pork_part])]
+    elif pork_part is None:
+        # pork_part가 None일 때: 수입 돼지고기인지 확인
+        # 수입 돼지고기는 part_name이 "Import_Pork_"로 시작하는 경우
+        # 하지만 현재 API는 part_name을 받지 않으므로, pork_part가 None이고
+        # beef_part도 None이면 기본 부위 목록 사용 (국내 돼지고기)
+        # beef_part가 지정되어 있으면 돼지고기는 조회하지 않음
+        if beef_part is None:
+            # beef_part와 pork_part가 모두 None이면 국내 돼지고기 기본 부위 사용
+            pork_parts = default_pork_parts
+        else:
+            pork_parts = []  # 소고기만 선택된 경우 돼지고기는 조회하지 않음
+    else:
+        # 잘못된 pork_part 코드인 경우 빈 리스트
+        pork_parts = []
+    
+    beef_items: List[PriceItem] = []
+    pork_items: List[PriceItem] = []
+
+    async def _fetch_beef(code: str, name: str):
+        try:
+            data = await price_service.fetch_current_price(
+                part_name=code, region=region, grade_code=grade_code, db=db
+            )
+            if data.get("currentPrice", 0) > 0:
+                return (code, name, data)
+        except HTTPException as e:
+            logger.warning("소 가격 조회 실패 (%s): HTTP %s - %s", name or code, e.status_code, e.detail)
+        except Exception as e:
+            logger.warning("소 가격 조회 실패 (%s): %s", name or code, e, exc_info=True)
+        return (code, name, None)
+
+    async def _fetch_pork(code: str, name: str):
+        try:
+            data = await price_service.fetch_current_price(
+                part_name=code, region=region, grade_code=grade_code, db=db
+            )
+            if data.get("currentPrice", 0) > 0:
+                return (code, name, data)
+        except HTTPException as e:
+            logger.warning("돼지 가격 조회 실패 (%s): HTTP %s - %s", name or code, e.status_code, e.detail)
+        except Exception as e:
+            logger.warning("돼지 가격 조회 실패 (%s): %s", name or code, e, exc_info=True)
+        return (code, name, None)
+
+    beef_results = await asyncio.gather(
+        *[_fetch_beef(code, name) for code, name in beef_parts],
+        return_exceptions=False,
+    )
+    pork_results = await asyncio.gather(
+        *[_fetch_pork(code, name) for code, name in pork_parts],
+        return_exceptions=False,
+    )
+
+    for _code, _name, data in beef_results:
+        if data:
+            grade_prices_raw = data.get("gradePrices", [])
+            grade_prices = [
+                GradePriceItem(
+                    grade=gp.get("grade", ""),
+                    price=gp.get("price", 0),
+                    unit=gp.get("unit", "100g"),
+                    priceDate=gp.get("priceDate"),
+                    trend=gp.get("trend", "flat"),
+                )
+                for gp in grade_prices_raw
+            ]
+            beef_items.append(
+                PriceItem(
+                    partName=_name or _code,
+                    category="beef",
+                    currentPrice=data["currentPrice"],
+                    unit=data.get("unit", "100g"),
+                    priceDate=data.get("price_date"),
+                    gradePrices=grade_prices,
+                )
+            )
+
+    for _code, _name, data in pork_results:
+        if data:
+            grade_prices_raw = data.get("gradePrices", [])
+            grade_prices = [
+                GradePriceItem(
+                    grade=gp.get("grade", ""),
+                    price=gp.get("price", 0),
+                    unit=gp.get("unit", "100g"),
+                    priceDate=gp.get("priceDate"),
+                    trend=gp.get("trend", "flat"),
+                )
+                for gp in grade_prices_raw
+            ]
+            pork_items.append(
+                PriceItem(
+                    partName=_name or _code,
+                    category="pork",
+                    currentPrice=data["currentPrice"],
+                    unit=data.get("unit", "100g"),
+                    priceDate=data.get("price_date"),
+                    gradePrices=grade_prices,
+                )
+            )
+
+    return DashboardPricesResponse(beef=beef_items, pork=pork_items)
+
+
+class PriceHistoryPoint(BaseModel):
+    week: str  # "01.06~01.12" (주 구간 라벨)
+    partName: str
+    price: int
+
+
+class PriceHistoryResponse(BaseModel):
+    beef: List[PriceHistoryPoint]
+    pork: List[PriceHistoryPoint]
+
+
+def _aggregate_daily_by_week(daily: list[dict], part_name: str) -> list[dict]:
+    """
+    일별 리스트를 1주일 간격으로 집계. 어제 날짜 기준으로 최근 N주간 데이터를 주별로 집계.
+    주는 월요일부터 일요일까지로 계산하며, 각 주의 평균 가격을 계산합니다.
+    Returns: [ {"week": "01.29~02.04", "partName": "...", "price": int}, ... ]
+    """
+    if not daily:
+        return []
+    
+    # 어제 날짜 기준 (KAMIS API는 어제 날짜까지만 데이터 제공)
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+    
+    # 실제 데이터 날짜 파싱 및 어제 이후 날짜 필터링
+    valid_points = []
+    for point in daily:
+        d = point.get("date", "")
+        if len(d) < 10:
+            continue
+        try:
+            dt_obj = datetime.strptime(d[:10], "%Y-%m-%d").date()
+            # 어제 날짜를 넘어가는 데이터는 제외
+            if dt_obj > yesterday:
+                continue
+            price = point.get("price", 0)
+            if price > 0:
+                valid_points.append((dt_obj, price))
+        except (ValueError, TypeError):
+            continue
+    
+    if not valid_points:
+        return []
+    
+    # 주별로 그룹화: (주 시작일, 주 끝일) -> [(날짜, 가격), ...]
+    # 주는 월요일(0)부터 일요일(6)까지
+    # 각 주 내에서 가장 최신 날짜의 가격만 사용 (실시간 가격 정보와 동일한 로직)
+    by_week: dict[tuple[date, date], list[tuple[date, int]]] = defaultdict(list)
+    
+    for dt_obj, price in valid_points:
+        # 주 시작일 계산 (월요일 기준)
+        days_since_monday = dt_obj.weekday()
+        week_start = dt_obj - timedelta(days=days_since_monday)
+        # 주 끝일 계산 (일요일)
+        week_end = week_start + timedelta(days=6)
+        # 어제 날짜를 넘지 않도록 주 끝일 제한
+        week_end = min(week_end, yesterday)
+        
+        by_week[(week_start, week_end)].append((dt_obj, price))
+    
+    # 주별로 가장 최신 날짜의 가격만 사용 (실시간 가격 정보와 동일한 로직)
+    # 주 시작일 기준으로 정렬 (오름차순: 오래된 주가 먼저)
+    result = []
+    for (week_start, week_end), date_price_list in sorted(by_week.items(), key=lambda x: (x[0][0], x[0][1])):  # 주 시작일, 끝일 기준 오름차순
+        if date_price_list:
+            # 각 주 내에서 가장 최신 날짜의 가격만 사용 (날짜 내림차순 정렬 후 첫 번째)
+            date_price_list.sort(key=lambda x: x[0], reverse=True)  # 날짜 내림차순
+            latest_date_in_week, latest_price = date_price_list[0]
+            
+            # 주 라벨 생성: "MM.DD~MM.DD" 형식
+            # 연도가 바뀌는 경우도 고려 (예: 12.29~01.04)
+            week_label = f"{week_start.month:02d}.{week_start.day:02d}~{week_end.month:02d}.{week_end.day:02d}"
+            result.append({
+                "week": week_label,
+                "partName": part_name,
+                "price": latest_price,  # 각 주의 가장 최신 날짜 가격만 사용
+            })
+    
+    # 날짜 순서대로 정렬되어 반환됨
+    return result
+
+
+@router.get(
+    "/prices/history",
+    response_model=PriceHistoryResponse,
+    summary="주별 가격 변동 (그래프용, periodProductList)",
+)
+async def get_dashboard_price_history(
+    region: str = "전국",
+    beef_part: str | None = None,
+    pork_part: str | None = None,
+    grade_code: str = "00",
+    weeks: int = 6,
+):
+    """
+    KAMIS 기간별 시세 API(periodProductList, p_startday/p_endday)로 최근 N주 일별 조회 후
+    1주일 간격으로 집계. 실시간 시세와 동일한 지역/등급 필터 적용.
+    """
+    beef_part_map = {
+        "Beef_Tenderloin": "소/안심",
+        "Beef_Ribeye": "소/등심",
+        "Beef_Round": "소/우둔",
+        "Beef_Brisket": "소/양지",
+        "Beef_Rib": "소/갈비",
+        # 수입 소고기
+        "Import_Beef_Brisket_US": "수입 소고기/양지(냉장) - 미국산",
+        "Import_Beef_Brisket_AU": "수입 소고기/양지(냉장) - 호주산",
+        "Import_Beef_Rib": "수입 소고기/갈비",
+        "Import_Beef_Rib_AU": "수입 소고기/갈비 - 호주산",
+        "Import_Beef_Ribeye_AU": "수입 소고기/갈비살 - 호주산",
+        "Import_Beef_ChuckEye_US": "수입 소고기/척아이롤(냉장) - 미국산",
+        "Import_Beef_ChuckEye_AU": "수입 소고기/척아이롤(냉장) - 호주산",
+        "Import_Beef_ChuckEye_Frozen_US": "수입 소고기/척아이롤(냉동) - 미국산",
+        "Import_Beef_ChuckEye_Frozen_AU": "수입 소고기/척아이롤(냉동) - 호주산",
+    }
+    pork_part_map = {
+        "Pork_Tenderloin": "돼지/안심",
+        "Pork_Loin": "돼지/등심",
+        "Pork_Neck": "돼지/목심",
+        "Pork_PicnicShoulder": "돼지/앞다리",
+        "Pork_Ham": "돼지/뒷다리",
+        "Pork_Belly": "돼지/삼겹살",
+        "Pork_Ribs": "돼지/갈비",
+        "Import_Pork_Belly": "수입 돼지고기/삼겹살",
+    }
+    default_beef = [("Beef_Ribeye", "소/등심")]
+    default_pork = [("Pork_Belly", "돼지/삼겹살")]
+
+    beef_parts = (
+        [(beef_part, beef_part_map[beef_part])]
+        if beef_part and beef_part in beef_part_map
+        else default_beef if pork_part is None else []
+    )
+    pork_parts = (
+        [(pork_part, pork_part_map[pork_part])]
+        if pork_part and pork_part in pork_part_map
+        else default_pork if beef_part is None else []
+    )
+
+    beef_history: List[PriceHistoryPoint] = []
+    pork_history: List[PriceHistoryPoint] = []
+
+    for code, name in beef_parts:
+        try:
+            daily = await fetch_kamis_price_period(
+                part_name=code,
+                region=region,
+                grade_code=grade_code,
+                weeks=weeks,
+            )
+            logger.info(f"소 주별 시세 조회 성공 ({name}): {len(daily)}개 일별 데이터")
+            if not daily:
+                logger.warning(f"소 주별 시세 데이터 없음 ({name})")
+                continue
+            aggregated = _aggregate_daily_by_week(daily, name)
+            logger.info(f"소 주별 시세 집계 완료 ({name}): {len(aggregated)}개 주 데이터")
+            for pt in aggregated:
+                beef_history.append(
+                    PriceHistoryPoint(week=pt["week"], partName=pt["partName"], price=pt["price"])
+                )
+        except HTTPException as e:
+            logger.error(f"소 주별 시세 HTTP 에러 ({name}): {e.status_code} - {e.detail}")
+            raise
+        except Exception as e:
+            logger.error(f"소 주별 시세 조회 실패 ({name}): {e}", exc_info=True)
+
+    for code, name in pork_parts:
+        try:
+            daily = await fetch_kamis_price_period(
+                part_name=code,
+                region=region,
+                grade_code=grade_code,
+                weeks=weeks,
+            )
+            logger.info(f"돼지 주별 시세 조회 성공 ({name}): {len(daily)}개 일별 데이터")
+            if not daily:
+                logger.warning(f"돼지 주별 시세 데이터 없음 ({name})")
+                continue
+            aggregated = _aggregate_daily_by_week(daily, name)
+            logger.info(f"돼지 주별 시세 집계 완료 ({name}): {len(aggregated)}개 주 데이터")
+            for pt in aggregated:
+                pork_history.append(
+                    PriceHistoryPoint(week=pt["week"], partName=pt["partName"], price=pt["price"])
+                )
+        except HTTPException as e:
+            logger.error(f"돼지 주별 시세 HTTP 에러 ({name}): {e.status_code} - {e.detail}")
+            raise
+        except Exception as e:
+            logger.error(f"돼지 주별 시세 조회 실패 ({name}): {e}", exc_info=True)
+
+    return PriceHistoryResponse(beef=beef_history, pork=pork_history)
+
+
+@router.get(
+    "/popular-cuts",
+    response_model=PopularCutsResponse,
+    summary="실시간 인기 부위 (최근 7일 인식 횟수 기준)",
+)
+async def get_popular_cuts(
+    db: AsyncSession = Depends(get_db),
+    limit: int = 5,
+):
+    """
+    최근 7일간 가장 많이 인식된 부위 Top N 조회.
+    
+    - count: 인식 횟수
+    - trend: 전주 대비 증가율 (예: "+12%")
+    - currentPrice: KAMIS API 가격 (캐시 사용)
+    """
+    # 기준 날짜: 최근 7일 (한국 시간 기준)
+    now = now_kst()
+    week_ago = now - timedelta(days=7)
+    two_weeks_ago = now - timedelta(days=14)
+    
+    # 최근 7일 집계
+    recent_query = (
+        select(
+            RecognitionLog.part_name,
+            func.count(RecognitionLog.id).label("count"),
+        )
+        .where(RecognitionLog.created_at >= week_ago)
+        .where(RecognitionLog.part_name != "unknown")
+        .group_by(RecognitionLog.part_name)
+        .order_by(desc("count"))
+        .limit(limit)
+    )
+    recent_result = await db.execute(recent_query)
+    recent_rows = recent_result.all()
+    
+    # 전주 7일 집계 (트렌드 계산용)
+    prev_query = (
+        select(
+            RecognitionLog.part_name,
+            func.count(RecognitionLog.id).label("count"),
+        )
+        .where(RecognitionLog.created_at >= two_weeks_ago)
+        .where(RecognitionLog.created_at < week_ago)
+        .where(RecognitionLog.part_name != "unknown")
+        .group_by(RecognitionLog.part_name)
+    )
+    prev_result = await db.execute(prev_query)
+    prev_rows = prev_result.all()
+    prev_counts = {row.part_name: row.count for row in prev_rows}
+    
+    items = []
+    for row in recent_rows:
+        part_name = row.part_name
+        current_count = row.count
+        prev_count = prev_counts.get(part_name, 0)
+        
+        # 트렌드 계산 (전주 대비 증감률, prev=0이면 "신규"로 표시)
+        if prev_count == 0:
+            trend = "신규" if current_count > 0 else "0%"
+        else:
+            change = ((current_count - prev_count) / prev_count) * 100
+            trend = f"{'+' if change > 0 else ''}{int(change)}%"
+        
+        # KAMIS 가격 조회 (캐시 우선, 실패 시 None)
+        current_price = None
+        try:
+            price_data = await price_service.fetch_current_price(
+                part_name=part_name,
+                region="seoul",
+                db=db,
+            )
+            current_price = price_data.get("currentPrice")
+        except Exception as e:
+            logger.warning(f"인기 부위 가격 조회 실패 ({part_name}): {e}")
+        
+        items.append(
+            PopularCutItem(
+                name=part_name,
+                count=current_count,
+                trend=trend,
+                currentPrice=current_price,
+            )
+        )
+    
+    # 데이터 없을 시 빈 리스트 반환 (더미 데이터 제거)
+    if not items:
+        print("=" * 50)
+        print(f"🚨 [API INFO] Endpoint: /api/dashboard/popular-cuts")
+        print(f"🚨 [DETAILS]: 인식 로그 데이터 없음 (최근 7일)")
+        print("=" * 50)
+        logger.warning("인기 부위 데이터 없음 (최근 7일간 인식 로그 없음)")
+    
+    return PopularCutsResponse(items=items)
+
+
+@router.get(
+    "/prices/history/check",
+    summary="주별 가격 이력 API 연결 확인",
+)
+async def get_dashboard_price_history_check():
+    """
+    KAMIS API 연결 상태 확인 (주별 가격 이력용).
+    실제 API 호출을 통해 연결 가능 여부를 확인합니다.
+    """
+    from ..apis import fetch_kamis_price_period, settings
+    
+    key = (settings.kamis_api_key or "").strip()
+    if not key:
+        return {
+            "connected": False,
+            "message": "KAMIS API 키가 설정되지 않았습니다.",
+        }
+    
+    # 실제 API 호출로 연결 확인 (소/등심 1+등급으로 단일 등급 조회 - "00"은 01/02/03 병합이라 실패 가능)
+    try:
+        test_data = await fetch_kamis_price_period(
+            part_name="Beef_Ribeye",
+            region="전국",
+            grade_code="02",  # 1+등급 단일 조회로 연결 여부 확인
+            weeks=1,  # 최소한의 데이터만 요청
+        )
+        if test_data:
+            return {
+                "connected": True,
+                "message": "KAMIS API 연결 성공",
+            }
+        else:
+            return {
+                "connected": False,
+                "message": "KAMIS API 응답 데이터 없음",
+            }
+    except HTTPException as e:
+        logger.warning(f"KAMIS API 연결 확인 실패: {e.status_code} - {e.detail}")
+        return {
+            "connected": False,
+            "message": f"KAMIS API 연결 실패: {e.detail}",
+        }
+    except Exception as e:
+        logger.warning(f"KAMIS API 연결 확인 실패: {e}", exc_info=True)
+        return {
+            "connected": False,
+            "message": f"KAMIS API 연결 실패: {str(e)}",
+        }
