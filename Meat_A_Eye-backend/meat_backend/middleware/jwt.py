@@ -112,5 +112,24 @@ async def get_current_user_optional(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(security)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> Member | None:
-    """인증 선택. 토큰 없으면 None, 있으면 멤버 반환."""
-    return await _get_member_from_token(credentials, db)
+    """인증 선택. 토큰 없으면 None (게스트), 토큰 있으나 만료/무효면 401."""
+    if not credentials or not credentials.credentials:
+        return None  # 토큰 미전달 → 정상적인 게스트
+    # 토큰이 전달되었으나 디코딩 실패 → 만료 또는 변조
+    payload = decode_token(credentials.credentials)
+    if not payload or "sub" not in payload:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="토큰이 만료되었거나 유효하지 않습니다. 다시 로그인해주세요.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    member_id = int(payload["sub"])
+    result = await db.execute(select(Member).where(Member.id == member_id))
+    member = result.scalar_one_or_none()
+    if not member:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="사용자를 찾을 수 없습니다. 다시 로그인해주세요.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return member

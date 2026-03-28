@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import ssl
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -24,6 +25,16 @@ from fastapi import HTTPException
 from .config.settings import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _get_kamis_ssl_context() -> ssl.SSLContext:
+    """KAMIS 구형 서버 대응용 SSL 컨텍스트 (보안레벨 1 + LEGACY_SERVER_CONNECT)."""
+    ctx = ssl.create_default_context()
+    ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
+    ctx.options |= getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
 
 # ---------------------------------------------------------------------------
 # 공통 유틸
@@ -758,7 +769,9 @@ async def _fetch_kamis_price_single(
     )
 
     try:
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            timeout=15.0, follow_redirects=True, verify=_get_kamis_ssl_context(),
+        ) as client:
             req = client.build_request("GET", base, params=params)
             logger.debug("KAMIS API 요청 URL (실시간): %s", req.url)
             resp = await client.send(req)
@@ -1059,7 +1072,9 @@ async def fetch_kamis_price_period(
     )
 
     try:
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            timeout=15.0, follow_redirects=True, verify=_get_kamis_ssl_context(),
+        ) as client:
             req = client.build_request("GET", base, params=params)
             logger.debug("KAMIS API 요청 URL: %s", req.url)
             resp = await client.send(req)

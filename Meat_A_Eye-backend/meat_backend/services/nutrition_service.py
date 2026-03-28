@@ -96,7 +96,9 @@ def _search_conditions(part_name: str) -> tuple[str, dict]:
         conditions.append("food_nm LIKE :p0")
         params["p0"] = f"%{part_name}%"
     where_sql = " AND ".join(conditions)
-    return where_sql, params
+    # OR 버전: AND가 너무 엄격할 때 느슨한 검색용
+    where_sql_or = " OR ".join(conditions)
+    return where_sql, params, where_sql_or
 
 
 async def _fetch_from_api(part_name: str) -> dict[str, Any] | None:
@@ -273,8 +275,9 @@ async def _fetch_from_api(part_name: str) -> dict[str, Any] | None:
 async def _fetch_from_db(part_name: str, db: AsyncSession) -> dict[str, Any]:
     """
     DB meat_nutrition에서 등급별 + 세부부위별 영양정보 조회.
+    AND 조건으로 먼저 검색하고, 결과가 없으면 OR 조건으로 재시도합니다.
     """
-    where_sql, params = _search_conditions(part_name)
+    where_sql, params, where_sql_or = _search_conditions(part_name)
     sql = f"SELECT id, food_nm, calories, protein, fat, carbs FROM meat_nutrition WHERE {where_sql} LIMIT 200"
     
     print(f"🗄️ [영양정보 DB] 조회 시작: {part_name}")
@@ -284,17 +287,35 @@ async def _fetch_from_db(part_name: str, db: AsyncSession) -> dict[str, Any]:
     try:
         result = await db.execute(text(sql), params)
         rows = result.mappings().all()
-        print(f"🗄️ [영양정보 DB] 조회 결과: {len(rows)}건")
+        print(f"🗄️ [영양정보 DB] 조회 결과 (AND): {len(rows)}건")
+        
+        # AND 조건으로 결과 없으면 OR 조건으로 재시도
+        if not rows and where_sql != where_sql_or:
+            sql_or = f"SELECT id, food_nm, calories, protein, fat, carbs FROM meat_nutrition WHERE {where_sql_or} LIMIT 200"
+            print(f"🗄️ [영양정보 DB] AND 결과 없음 → OR 재시도: {sql_or}")
+            result = await db.execute(text(sql_or), params)
+            rows = result.mappings().all()
+            print(f"🗄️ [영양정보 DB] 조회 결과 (OR): {len(rows)}건")
     except Exception as e:
         print(f"🚨 [REAL ERROR] 영양정보 DB 조회 실패: {e}")
         raise HTTPException(status_code=502, detail=f"영양정보 DB 조회 실패: {e}") from e
     
     if not rows:
-        print(f"⚠️ [영양정보 DB] 데이터 없음")
-        raise HTTPException(
-            status_code=404,
-            detail=f"'{part_name}'에 해당하는 영양정보를 찾을 수 없습니다.",
-        )
+        print(f"⚠️ [영양정보 DB] 데이터 없음 (AND + OR 모두 0건)")
+        # 404 대신 기본 영양정보 반환 (데이터 없음을 명시)
+        return {
+            "by_grade": [],
+            "default": {
+                "calories": None,
+                "protein": None,
+                "fat": None,
+                "carbohydrate": None,
+                "grade": "일반",
+                "subpart": "기본",
+                "source": "db",
+                "notice": f"'{part_name}'에 해당하는 영양정보가 DB에 없습니다.",
+            },
+        }
     
     # 등급별 + 세부부위별로 그룹화
     by_grade: dict[str, dict[str, Any]] = {}
